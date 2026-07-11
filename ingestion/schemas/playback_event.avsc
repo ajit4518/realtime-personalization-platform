@@ -1,0 +1,59 @@
+{
+  "type": "record",
+  "name": "PlaybackEvent",
+  "namespace": "com.streaming.playback",
+  "doc": "A single player telemetry event. Emitted by client SDKs every 10 seconds during playback and on every state transition. This schema is registered as the value contract for the playback.events topic; the Schema Registry is configured BACKWARD so a consumer can always be upgraded after a producer.",
+  "fields": [
+    {
+      "name": "event_id",
+      "type": {"type": "string", "logicalType": "uuid"},
+      "doc": "Client-generated. Used for exactly-once deduplication in the stream layer, because at-least-once delivery from mobile clients on flaky networks is a given."
+    },
+    {"name": "session_id", "type": {"type": "string", "logicalType": "uuid"}},
+    {"name": "profile_id", "type": "long"},
+    {"name": "title_id", "type": "long"},
+    {"name": "region_code", "type": "string"},
+    {
+      "name": "event_type",
+      "type": {
+        "type": "enum",
+        "name": "PlaybackEventType",
+        "symbols": ["START", "HEARTBEAT", "PAUSE", "RESUME", "SEEK", "REBUFFER", "BITRATE_SHIFT", "ERROR", "COMPLETE", "ABANDON"]
+      }
+    },
+    {
+      "name": "event_ts",
+      "type": {"type": "long", "logicalType": "timestamp-millis"},
+      "doc": "Device clock at emission. Flink watermarks are derived from this, not from ingestion time, so late arrivals from backgrounded mobile apps are handled correctly."
+    },
+    {
+      "name": "ingest_ts",
+      "type": {"type": "long", "logicalType": "timestamp-millis"},
+      "doc": "Gateway receipt time. event_ts minus ingest_ts is our client clock-skew monitor."
+    },
+    {"name": "position_seconds", "type": "int", "doc": "Playhead position within the title."},
+    {"name": "device_type", "type": "string"},
+    {"name": "app_version", "type": "string"},
+    {
+      "name": "cdn_pop",
+      "type": ["null", "string"],
+      "default": null,
+      "doc": "Edge point of presence serving the stream. The single most useful dimension when quality regresses, because incidents are almost always POP-scoped."
+    },
+    {"name": "bitrate_kbps", "type": ["null", "int"], "default": null},
+    {
+      "name": "rebuffer_ms",
+      "type": ["null", "int"],
+      "default": null,
+      "doc": "Stall duration for REBUFFER events. Rebuffer seconds per playback hour is the headline quality metric."
+    },
+    {"name": "startup_ms", "type": ["null", "int"], "default": null, "doc": "Time to first frame, populated on START only."},
+    {"name": "error_code", "type": ["null", "string"], "default": null},
+    {
+      "name": "ab_bucket",
+      "type": ["null", "string"],
+      "default": null,
+      "doc": "Experiment assignment, carried through to the warehouse so ranking model rollouts can be measured without a separate join."
+    }
+  ]
+}
