@@ -1,0 +1,65 @@
+{
+  "name": "streaming-postgres-source",
+  "config": {
+    "connector.class": "io.debezium.connector.postgresql.PostgresConnector",
+    "tasks.max": "1",
+
+    "database.hostname": "${env:PGHOST}",
+    "database.port": "5432",
+    "database.user": "${env:PGUSER}",
+    "database.password": "${env:PGPASSWORD}",
+    "database.dbname": "${env:PGDATABASE}",
+
+    "topic.prefix": "streaming",
+    "schema.include.list": "streaming",
+    "table.include.list": "streaming.subscribers,streaming.subscriptions,streaming.profiles,streaming.titles,streaming.title_availability,streaming.watch_sessions,streaming.ratings",
+
+    "plugin.name": "pgoutput",
+    "publication.name": "streaming_cdc",
+    "publication.autocreate.mode": "disabled",
+    "slot.name": "streaming_cdc_slot",
+
+    "snapshot.mode": "initial",
+    "snapshot.locking.mode": "none",
+
+    "key.converter": "io.confluent.connect.avro.AvroConverter",
+    "key.converter.schema.registry.url": "${env:SCHEMA_REGISTRY_URL}",
+    "value.converter": "io.confluent.connect.avro.AvroConverter",
+    "value.converter.schema.registry.url": "${env:SCHEMA_REGISTRY_URL}",
+
+    "decimal.handling.mode": "double",
+    "time.precision.mode": "connect",
+    "tombstones.on.delete": "true",
+
+    "heartbeat.interval.ms": "10000",
+    "heartbeat.action.query": "INSERT INTO streaming.debezium_heartbeat (ts) VALUES (now()) ON CONFLICT (id) DO UPDATE SET ts = now()",
+
+    "transforms": "unwrap,route",
+
+    "transforms.unwrap.type": "io.debezium.transforms.ExtractNewRecordState",
+    "transforms.unwrap.drop.tombstones": "false",
+    "transforms.unwrap.delete.handling.mode": "rewrite",
+    "transforms.unwrap.add.fields": "op,source.lsn,source.ts_ms,source.txId",
+
+    "transforms.route.type": "org.apache.kafka.connect.transforms.RegexRouter",
+    "transforms.route.regex": "streaming\\.streaming\\.(.*)",
+    "transforms.route.replacement": "cdc.$1",
+
+    "errors.tolerance": "all",
+    "errors.deadletterqueue.topic.name": "dlq.cdc.postgres",
+    "errors.deadletterqueue.topic.replication.factor": "3",
+    "errors.deadletterqueue.context.headers.enable": "true",
+    "errors.log.enable": "true",
+
+    "producer.override.compression.type": "zstd",
+    "producer.override.linger.ms": "20",
+    "producer.override.batch.size": "65536"
+  },
+
+  "_notes": {
+    "heartbeat.interval.ms": "Without heartbeats, a replication slot on a low-traffic table holds the WAL open and the RDS volume fills up. This is the single most common way a CDC pipeline takes down its own source database.",
+    "publication.autocreate.mode": "Disabled on purpose. The publication is owned by migrations (003_publication.sql), not by the connector, so a connector restart can never silently widen what we replicate.",
+    "snapshot.locking.mode": "none is safe here because pgoutput snapshots run in a repeatable-read transaction; it avoids taking an ACCESS SHARE lock storm on a live OLTP database.",
+    "delete.handling.mode": "rewrite keeps a __deleted flag on the record instead of dropping it, so the warehouse can model soft deletes rather than losing rows silently."
+  }
+}
