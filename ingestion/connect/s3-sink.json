@@ -1,0 +1,44 @@
+{
+  "name": "playback-events-s3-sink",
+  "config": {
+    "connector.class": "io.confluent.connect.s3.S3SinkConnector",
+    "tasks.max": "6",
+
+    "topics.regex": "playback\\.events|cdc\\..*",
+    "s3.bucket.name": "${env:LAKE_BUCKET}",
+    "s3.region": "${env:AWS_REGION}",
+    "s3.part.size": "26214400",
+
+    "storage.class": "io.confluent.connect.s3.storage.S3Storage",
+    "format.class": "io.confluent.connect.s3.format.parquet.ParquetFormat",
+    "parquet.codec": "snappy",
+
+    "partitioner.class": "io.confluent.connect.storage.partitioner.TimeBasedPartitioner",
+    "path.format": "'dt'=YYYY-MM-dd/'hour'=HH",
+    "partition.duration.ms": "3600000",
+    "timestamp.extractor": "RecordField",
+    "timestamp.field": "event_ts",
+    "locale": "en-US",
+    "timezone": "UTC",
+
+    "flush.size": "200000",
+    "rotate.interval.ms": "300000",
+    "rotate.schedule.interval.ms": "900000",
+
+    "key.converter": "io.confluent.connect.avro.AvroConverter",
+    "key.converter.schema.registry.url": "${env:SCHEMA_REGISTRY_URL}",
+    "value.converter": "io.confluent.connect.avro.AvroConverter",
+    "value.converter.schema.registry.url": "${env:SCHEMA_REGISTRY_URL}",
+
+    "behavior.on.null.values": "ignore",
+    "errors.tolerance": "all",
+    "errors.deadletterqueue.topic.name": "dlq.s3.sink",
+    "errors.deadletterqueue.topic.replication.factor": "3"
+  },
+
+  "_notes": {
+    "timestamp.extractor": "RecordField on event_ts, not Wallclock. Partitioning by ingestion time means a replay writes yesterday's events into today's partition and every backfill silently corrupts the warehouse.",
+    "flush.size + rotate.interval.ms": "Two triggers on purpose: high-volume topics roll on size to keep Parquet files near 128 MB, low-volume topics roll on time so freshness SLAs are still met when traffic is thin.",
+    "parquet over json": "Columnar at the landing zone means the warehouse external tables prune by column and partition. On this event volume it is roughly a 6x scan reduction versus newline JSON."
+  }
+}
