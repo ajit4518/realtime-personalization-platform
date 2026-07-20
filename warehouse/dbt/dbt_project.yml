@@ -1,0 +1,79 @@
+name: 'streaming_warehouse'
+version: '1.0.0'
+config-version: 2
+
+profile: 'streaming_warehouse'
+
+model-paths: ["models"]
+macro-paths: ["macros"]
+test-paths: ["tests"]
+snapshot-paths: ["snapshots"]
+seed-paths: ["seeds"]
+
+target-path: "target"
+clean-targets: ["target", "dbt_packages"]
+
+vars:
+  # Every incremental model reads these instead of hardcoding a window, so a
+  # backfill is `dbt run --vars '{"start_date": "2026-01-01"}'` rather than an
+  # edit to fifteen files.
+  start_date: '2026-01-01'
+  lookback_days: 3
+
+  # Sessions shorter than this are almost always accidental clicks. Excluding
+  # them from engagement metrics moved offline/online AUC agreement by 4 points.
+  min_valid_session_seconds: 30
+
+  # A title counts as "completed" past this fraction. Not 1.0, because credits
+  # roll and most viewers leave before the stream ends.
+  completion_threshold: 0.90
+
+models:
+  streaming_warehouse:
+    +materialized: view
+
+    staging:
+      +materialized: view
+      +schema: staging
+      # Staging is a thin renaming and typing layer. Anything heavier belongs
+      # downstream where it can be tested and materialised.
+
+    intermediate:
+      +materialized: ephemeral
+      +schema: intermediate
+
+    marts:
+      +materialized: table
+      +schema: marts
+      core:
+        +materialized: incremental
+        +on_schema_change: append_new_columns
+
+    features:
+      +materialized: incremental
+      +schema: features
+      # Feature tables are read by training jobs that scan wide date ranges,
+      # so they are sorted and distributed for that access pattern.
+      +sort: ['feature_date', 'profile_id']
+      +dist: 'profile_id'
+
+seeds:
+  streaming_warehouse:
+    +schema: seeds
+
+snapshots:
+  streaming_warehouse:
+    +target_schema: snapshots
+    # Subscription tier history is the backbone of churn analysis and cannot be
+    # reconstructed from the OLTP table, which only holds the current state.
+    +strategy: timestamp
+    +updated_at: updated_at
+
+tests:
+  +store_failures: true
+  +schema: dbt_test_failures
+  # Failing rows are persisted rather than just counted. Debugging a failed
+  # test from a row count alone wastes an hour every time.
+
+on-run-end:
+  - "{{ log_run_results(results) }}"
