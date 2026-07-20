@@ -1,0 +1,73 @@
+version: 2
+
+sources:
+  - name: cdc
+    description: >
+      Change streams from the OLTP Postgres, landed to S3 by Kafka Connect and
+      exposed to the warehouse as external tables. Each row carries the
+      Debezium operation (`__op`) and log sequence number (`__lsn`), so
+      staging can reconstruct current state without a second read of the source
+      database.
+    database: "{{ env_var('WAREHOUSE_DATABASE', 'analytics') }}"
+    schema: raw_cdc
+
+    # Freshness is checked in CI and by the Airflow monitor DAG. The warn
+    # threshold is roughly twice the expected sink flush interval; error is the
+    # point at which the marts stop being trustworthy for a morning stand-up.
+    loaded_at_field: __source_ts
+    freshness:
+      warn_after: {count: 30, period: minute}
+      error_after: {count: 2, period: hour}
+
+    tables:
+      - name: subscribers
+        columns:
+          - name: subscriber_id
+            tests: [not_null]
+      - name: subscriptions
+        description: "REPLICA IDENTITY FULL, so `before` images are available for tier-change analysis."
+      - name: profiles
+      - name: titles
+      - name: title_availability
+        freshness: null  # Reference data; changes rarely and a stale read is harmless.
+      - name: watch_sessions
+        freshness:
+          warn_after: {count: 15, period: minute}
+          error_after: {count: 1, period: hour}
+      - name: ratings
+
+  - name: events
+    description: >
+      Raw player telemetry landed from the `playback.events` Kafka topic as
+      hourly Parquet partitions. This is the same stream the Flink jobs read;
+      the warehouse copy exists so offline features are computed from the
+      identical input the online path saw.
+    database: "{{ env_var('WAREHOUSE_DATABASE', 'analytics') }}"
+    schema: raw_events
+    loaded_at_field: event_ts
+    freshness:
+      warn_after: {count: 20, period: minute}
+      error_after: {count: 90, period: minute}
+
+    tables:
+      - name: playback_events
+        description: "One row per player event. Partitioned by dt and hour."
+        columns:
+          - name: event_id
+            description: "Client-generated UUID. Not unique in the raw layer: clients retry."
+            tests:
+              - not_null
+          - name: session_id
+            tests: [not_null]
+          - name: event_type
+            tests:
+              - accepted_values:
+                  arguments:
+                    values: ['START', 'HEARTBEAT', 'PAUSE', 'RESUME', 'SEEK',
+                             'REBUFFER', 'BITRATE_SHIFT', 'ERROR', 'COMPLETE', 'ABANDON']
+
+      - name: qoe_windows
+        description: "Per-POP quality aggregates emitted by the Flink anomaly job."
+      - name: qoe_alerts
+        description: "Regressions the detector raised. Joined against incidents for precision tracking."
+        freshness: null
