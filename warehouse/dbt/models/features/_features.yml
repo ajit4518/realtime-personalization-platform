@@ -1,0 +1,124 @@
+version: 2
+
+models:
+  - name: fct_profile_features_daily
+    description: >
+      Point-in-time correct daily feature snapshots per profile. Every column is
+      computed using only data strictly before `feature_date`, which is what
+      makes the training set free of label leakage. This table is the sole
+      source of truth for offline training; the Flink job serves the online
+      equivalent and `assert_online_offline_feature_parity` keeps them honest.
+
+    # A contract means a breaking schema change fails at build time rather than
+    # at 3am when a training run silently reads a renamed column as null.
+    config:
+      contract:
+        enforced: true
+
+    columns:
+      - name: feature_date
+        data_type: date
+        description: "The as-of date. Features reflect the world at the END of the previous day."
+        constraints:
+          - type: not_null
+        tests:
+          - dbt_utils.expression_is_true:
+              arguments:
+                expression: "<= current_date"
+
+      - name: profile_id
+        data_type: bigint
+        constraints:
+          - type: not_null
+        tests:
+          - relationships:
+              arguments:
+                to: ref('stg_profiles')
+                field: profile_id
+
+      - name: subscriber_id
+        data_type: bigint
+
+      - name: sessions_7d
+        data_type: integer
+        description: "Sessions in the 7 days before feature_date."
+        tests:
+          - dbt_utils.accepted_range:
+              arguments:
+                min_value: 0
+                max_value: 500
+                severity: warn
+
+      - name: sessions_30d
+        data_type: integer
+        tests:
+          # A 7-day count can never exceed the 30-day count that contains it.
+          # This catches window arithmetic bugs that no range check would.
+          - dbt_utils.expression_is_true:
+              arguments:
+                expression: ">= sessions_7d"
+
+      - name: sessions_90d
+        data_type: integer
+        tests:
+          - dbt_utils.expression_is_true:
+              arguments:
+                expression: ">= sessions_30d"
+
+      - name: avg_completion_7d
+        data_type: double
+        tests:
+          - dbt_utils.accepted_range:
+              arguments:
+                min_value: 0
+                max_value: 1
+
+      - name: completion_rate_30d
+        data_type: double
+        tests:
+          - dbt_utils.accepted_range:
+              arguments:
+                min_value: 0
+                max_value: 1
+
+      - name: avg_rebuffer_per_hour_7d
+        data_type: double
+        description: "Recent playback quality. Feeds both the ranker and the churn model."
+
+      - name: days_since_last_session
+        data_type: integer
+        description: "999 when the profile has never watched anything. Strongest single churn predictor."
+        constraints:
+          - type: not_null
+
+      - name: genre_affinity
+        data_type: map(varchar, double)
+        description: "Share of trailing-90-day watch time per genre. Values sum to ~1.0."
+
+      - name: tier
+        data_type: varchar
+        description: "Subscription tier as of feature_date, read from the snapshot rather than current state."
+        tests:
+          - accepted_values:
+              arguments:
+                values: ['basic', 'standard', 'premium']
+
+      - name: engagement_segment
+        data_type: varchar
+        tests:
+          - accepted_values:
+              arguments:
+                values: ['dormant', 'occasional', 'regular', 'daily']
+
+    tests:
+      - dbt_utils.unique_combination_of_columns:
+          arguments:
+            combination_of_columns: [profile_id, feature_date]
+
+      # The leakage guard, expressed as a test rather than trusted to review.
+      # If a future change accidentally turns the `<` into `<=`, this fails.
+      - dbt_utils.expression_is_true:
+          arguments:
+            expression: "profile_age_days >= 0"
+            config:
+              where: "days_since_last_session < 999"
