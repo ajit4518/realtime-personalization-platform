@@ -1,0 +1,63 @@
+replicaCount: 4
+
+image:
+  repository: ""          # set per environment; no default that could point at the wrong registry
+  tag: ""                 # always the immutable git SHA, never "latest"
+  pullPolicy: IfNotPresent
+
+serviceAccount:
+  create: true
+  # IRSA: the pod assumes an IAM role directly, so no AWS keys exist anywhere
+  # in the cluster to be leaked or rotated.
+  annotations:
+    eks.amazonaws.com/role-arn: ""
+
+model:
+  bucket: ""
+
+service:
+  type: ClusterIP
+  port: 8000
+
+resources:
+  requests:
+    # Sized from a load test, not guessed. At 250 requests/second per pod the
+    # service uses ~1.4 cores; the request leaves headroom without reserving
+    # capacity that sits idle.
+    cpu: 1500m
+    # The model plus the FAISS index resident in memory is ~1.6 GB. 2Gi gives
+    # room for request buffers without inviting the OOM killer.
+    memory: 2Gi
+  limits:
+    cpu: 3000m
+    # Memory limit intentionally equals the request (see deployment.yaml).
+
+autoscaling:
+  enabled: true
+  minReplicas: 4
+  maxReplicas: 40
+  targetCPUUtilization: 65
+  targetRequestsPerPod: "250"
+
+ingress:
+  enabled: true
+  className: alb
+  annotations:
+    alb.ingress.kubernetes.io/scheme: internal
+    alb.ingress.kubernetes.io/target-type: ip
+    alb.ingress.kubernetes.io/healthcheck-path: /health/ready
+    # Must exceed the pod's terminationGracePeriodSeconds so the load balancer
+    # stops sending traffic before the container stops accepting it.
+    alb.ingress.kubernetes.io/target-group-attributes: deregistration_delay.timeout_seconds=30
+
+podAnnotations: {}
+nodeSelector:
+  workload: serving
+
+# Canary receives a small slice of live traffic before a full rollout, which is
+# how a model regression gets caught by real requests rather than by a dashboard
+# three hours later.
+canary:
+  enabled: true
+  weight: 5
+  replicaCount: 2

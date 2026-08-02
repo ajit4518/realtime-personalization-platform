@@ -1,0 +1,73 @@
+{{- if .Values.autoscaling.enabled }}
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: {{ include "recommendations.fullname" . }}
+  labels: {{- include "recommendations.labels" . | nindent 4 }}
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: {{ include "recommendations.fullname" . }}
+
+  minReplicas: {{ .Values.autoscaling.minReplicas }}
+  maxReplicas: {{ .Values.autoscaling.maxReplicas }}
+
+  metrics:
+    # CPU is the coarse signal.
+    - type: Resource
+      resource:
+        name: cpu
+        target:
+          type: Utilization
+          averageUtilization: {{ .Values.autoscaling.targetCPUUtilization }}
+
+    # Requests per pod is the better one. CPU alone reacts late here, because
+    # the service spends much of its time waiting on Redis rather than burning
+    # cycles, so load can double while CPU barely moves.
+    - type: Pods
+      pods:
+        metric:
+          name: recommendation_requests_per_second
+        target:
+          type: AverageValue
+          averageValue: {{ .Values.autoscaling.targetRequestsPerPod }}
+
+  behavior:
+    scaleUp:
+      # React fast. Under-provisioning shows up immediately as latency the
+      # viewer feels, and the cost of a few extra pods for a few minutes is
+      # trivial next to a slow home screen.
+      stabilizationWindowSeconds: 30
+      policies:
+        - type: Percent
+          value: 100
+          periodSeconds: 30
+        - type: Pods
+          value: 4
+          periodSeconds: 30
+      selectPolicy: Max
+
+    scaleDown:
+      # Shrink slowly. Traffic is spiky around content releases, and scaling
+      # down eagerly means paying the model-load cost again minutes later.
+      stabilizationWindowSeconds: 600
+      policies:
+        - type: Percent
+          value: 20
+          periodSeconds: 120
+      selectPolicy: Min
+---
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: {{ include "recommendations.fullname" . }}
+  labels: {{- include "recommendations.labels" . | nindent 4 }}
+spec:
+  # Expressed as a percentage rather than a fixed count so it stays correct as
+  # the HPA moves the replica count around. Without a PDB, a node drain during
+  # a cluster upgrade can remove every replica at once.
+  minAvailable: 75%
+  selector:
+    matchLabels: {{- include "recommendations.selectorLabels" . | nindent 6 }}
+{{- end }}

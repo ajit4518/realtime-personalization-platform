@@ -1,0 +1,170 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "recommendations.fullname" . }}
+  labels: {{- include "recommendations.labels" . | nindent 4 }}
+spec:
+  replicas: {{ .Values.replicaCount }}
+
+  # Surge one, never drop below the current count. The model takes ~15 seconds
+  # to load, so removing a pod before its replacement is ready would shrink
+  # serving capacity during every deploy.
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxSurge: 1
+      maxUnavailable: 0
+
+  selector:
+    matchLabels: {{- include "recommendations.selectorLabels" . | nindent 6 }}
+
+  template:
+    metadata:
+      labels: {{- include "recommendations.selectorLabels" . | nindent 8 }}
+      annotations:
+        prometheus.io/scrape: "true"
+        prometheus.io/port: "8000"
+        prometheus.io/path: "/metrics"
+        # Forces a rollout when config changes. Without this, a ConfigMap edit
+        # applies only to pods that happen to restart later, leaving the fleet
+        # running two different configurations indefinitely.
+        checksum/config: {{ include (print $.Template.BasePath "/configmap.yaml") . | sha256sum }}
+
+    spec:
+      serviceAccountName: {{ include "recommendations.serviceAccountName" . }}
+
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 10001
+        fsGroup: 10001
+        seccompProfile:
+          type: RuntimeDefault
+
+      # Spread across zones. Without this, the scheduler will happily place
+      # every replica in one AZ and a zone failure becomes a total outage.
+      topologySpreadConstraints:
+        - maxSkew: 1
+          topologyKey: topology.kubernetes.io/zone
+          whenUnsatisfiable: DoNotSchedule
+          labelSelector:
+            matchLabels: {{- include "recommendations.selectorLabels" . | nindent 14 }}
+        - maxSkew: 1
+          topologyKey: kubernetes.io/hostname
+          whenUnsatisfiable: ScheduleAnyway
+          labelSelector:
+            matchLabels: {{- include "recommendations.selectorLabels" . | nindent 14 }}
+
+      nodeSelector:
+        workload: serving
+
+      # Model artefacts are pulled once into a shared volume rather than baked
+      # into the image, so promoting a model does not require an image rebuild.
+      initContainers:
+        - name: fetch-model
+          image: amazon/aws-cli:2.15.0
+          command:
+            - sh
+            - -c
+            - |
+              set -euo pipefail
+              aws s3 sync "s3://${MODEL_BUCKET}/ranker/current/" /models/current/
+              aws s3 sync "s3://${MODEL_BUCKET}/index/current/" /models/index/
+              test -f /models/current/model.txt
+              test -f /models/current/metadata.json
+              echo "model artefacts verified"
+          env:
+            - name: MODEL_BUCKET
+              value: {{ .Values.model.bucket | quote }}
+          volumeMounts:
+            - name: models
+              mountPath: /models
+          resources:
+            requests: {cpu: 100m, memory: 128Mi}
+            limits: {cpu: 500m, memory: 512Mi}
+
+      containers:
+        - name: api
+          image: "{{ .Values.image.repository }}:{{ .Values.image.tag }}"
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+
+          ports:
+            - name: http
+              containerPort: 8000
+
+          env:
+            - name: RECO_REDIS_URL
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "recommendations.fullname" . }}-secrets
+                  key: redis-url
+            - name: RECO_MODEL_PATH
+              value: /models/current
+            - name: RECO_INDEX_PATH
+              value: /models/index
+            - name: APP_VERSION
+              value: {{ .Values.image.tag | quote }}
+
+          resources:
+            # Requests and limits are equal on memory (Guaranteed QoS) because
+            # the model's resident set is fixed and predictable; being evicted
+            # under node pressure would be gratuitous. CPU has headroom above
+            # the request so a traffic spike can burst rather than throttle.
+            requests:
+              cpu: {{ .Values.resources.requests.cpu }}
+              memory: {{ .Values.resources.requests.memory }}
+            limits:
+              cpu: {{ .Values.resources.limits.cpu }}
+              memory: {{ .Values.resources.requests.memory }}
+
+          # Startup probe carries the slow model load, which lets the liveness
+          # probe stay aggressive afterwards. Without it, either startup fails
+          # or a hung process takes minutes to be noticed.
+          startupProbe:
+            httpGet: {path: /health/live, port: http}
+            periodSeconds: 5
+            failureThreshold: 24   # up to 2 minutes to become live
+
+          livenessProbe:
+            httpGet: {path: /health/live, port: http}
+            periodSeconds: 10
+            timeoutSeconds: 2
+            failureThreshold: 3
+
+          # Readiness checks dependencies, liveness does not. A Redis blip
+          # should pull a pod out of the load balancer, never restart it.
+          readinessProbe:
+            httpGet: {path: /health/ready, port: http}
+            periodSeconds: 5
+            timeoutSeconds: 3
+            failureThreshold: 2
+            successThreshold: 1
+
+          lifecycle:
+            preStop:
+              exec:
+                # Give the load balancer time to observe the endpoint removal
+                # before the process starts refusing connections. Skipping this
+                # produces a burst of 502s on every single deploy.
+                command: ["sh", "-c", "sleep 8"]
+
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+
+          volumeMounts:
+            - name: models
+              mountPath: /models
+              readOnly: true
+            - name: tmp
+              mountPath: /tmp
+
+      # Longer than the preStop sleep plus the longest in-flight request.
+      terminationGracePeriodSeconds: 30
+
+      volumes:
+        - name: models
+          emptyDir: {sizeLimit: 4Gi}
+        - name: tmp
+          emptyDir: {sizeLimit: 256Mi}
