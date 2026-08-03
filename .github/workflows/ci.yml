@@ -1,0 +1,223 @@
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+# A new push supersedes the previous run on the same branch. Without this, a
+# busy PR queues five redundant builds and the useful one waits behind them.
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  PYTHON_VERSION: "3.11"
+
+jobs:
+  # Fast feedback first. Lint failing after a nine-minute test suite is nine
+  # minutes wasted on something a formatter would have fixed.
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: pip
+
+      - name: Install tooling
+        run: pip install ruff==0.4.9 mypy==1.10.0 sqlfluff==3.0.7
+
+      - name: Ruff
+        run: ruff check --output-format=github serving/ streaming/ ml/ orchestration/ ingestion/
+
+      - name: Format check
+        run: ruff format --check serving/ streaming/ ml/ orchestration/ ingestion/
+
+      - name: Type check
+        run: mypy serving/app ml/training --ignore-missing-imports
+
+      - name: SQL lint
+        run: sqlfluff lint warehouse/dbt/models --dialect postgres --processes 4
+
+  test:
+    runs-on: ubuntu-latest
+    needs: lint
+    services:
+      redis:
+        image: redis:7.2-alpine
+        ports: ["6379:6379"]
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 5s --health-timeout 3s --health-retries 5
+
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_PASSWORD: test
+          POSTGRES_DB: streaming
+        ports: ["5432:5432"]
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 5s --health-timeout 3s --health-retries 5
+
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: pip
+
+      - name: Install
+        run: |
+          pip install -r serving/requirements.txt
+          pip install pytest pytest-asyncio pytest-cov
+
+      - name: Verify the schema applies cleanly
+        env:
+          PGPASSWORD: test
+        run: |
+          psql -h localhost -U postgres -d streaming -v ON_ERROR_STOP=1 \
+               -f platform/postgres/001_schema.sql
+          psql -h localhost -U postgres -d streaming -v ON_ERROR_STOP=1 \
+               -f platform/postgres/002_seed.sql
+
+      - name: Unit tests
+        working-directory: serving
+        env:
+          RECO_REDIS_URL: redis://localhost:6379
+        run: pytest tests/ -v --cov=app --cov-report=xml --cov-fail-under=75
+
+  # dbt is compiled and tested against a real Postgres rather than only parsed.
+  # `dbt parse` catches syntax; it does not catch a column that no longer exists.
+  dbt:
+    runs-on: ubuntu-latest
+    needs: lint
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_PASSWORD: test
+          POSTGRES_DB: analytics
+        ports: ["5432:5432"]
+        options: >-
+          --health-cmd pg_isready --health-interval 5s --health-retries 5
+
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: pip
+
+      - name: Install dbt
+        run: pip install dbt-core==1.8.2 dbt-postgres==1.8.2
+
+      - name: Fetch production manifest
+        id: manifest
+        continue-on-error: true
+        uses: actions/download-artifact@v4
+        with:
+          name: dbt-manifest
+          path: warehouse/dbt/state/
+
+      - name: Build changed models only
+        working-directory: warehouse/dbt
+        env:
+          DBT_PROFILES_DIR: ${{ github.workspace }}/warehouse/dbt/ci
+        run: |
+          dbt deps
+          if [ -f state/manifest.json ]; then
+            # Slim CI: build what changed and what depends on it, not the whole
+            # project. On a warehouse this size that is a 40-minute CI run
+            # reduced to about four.
+            dbt build --select 'state:modified+' --defer --state ./state --target ci
+          else
+            echo "No prior manifest; building everything for this run."
+            dbt build --target ci
+          fi
+
+      - name: Upload manifest for the next run
+        if: github.ref == 'refs/heads/main'
+        uses: actions/upload-artifact@v4
+        with:
+          name: dbt-manifest
+          path: warehouse/dbt/target/manifest.json
+          retention-days: 30
+
+  validate-infra:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: 1.8.4
+
+      - name: Format
+        run: terraform -chdir=infra/terraform fmt -check -recursive
+
+      - name: Validate
+        run: |
+          terraform -chdir=infra/terraform init -backend=false
+          terraform -chdir=infra/terraform validate
+
+      # Policy scanning before anything reaches an account. Catching a public
+      # S3 bucket in review costs nothing; catching it in production is a
+      # disclosure notification.
+      - name: Security scan
+        uses: aquasecurity/tfsec-action@v1.0.3
+        with:
+          working_directory: infra/terraform
+          soft_fail: false
+
+  build-images:
+    runs-on: ubuntu-latest
+    needs: [test, dbt]
+    permissions:
+      contents: read
+      id-token: write   # OIDC to AWS; no long-lived access keys in secrets
+    strategy:
+      matrix:
+        include:
+          - name: recommendations
+            context: serving
+          - name: streaming
+            context: streaming
+          - name: ml-training
+            context: ml
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: docker/setup-buildx-action@v3
+
+      - uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_CI_ROLE_ARN }}
+          aws-region: us-east-1
+
+      - uses: aws-actions/amazon-ecr-login@v2
+        id: ecr
+
+      - name: Build and push
+        uses: docker/build-push-action@v5
+        with:
+          context: ${{ matrix.context }}
+          # Tagged with the immutable commit SHA. "latest" makes it impossible
+          # to know what is actually running during an incident.
+          tags: |
+            ${{ steps.ecr.outputs.registry }}/${{ matrix.name }}:${{ github.sha }}
+          push: ${{ github.ref == 'refs/heads/main' }}
+          cache-from: type=gha,scope=${{ matrix.name }}
+          cache-to: type=gha,mode=max,scope=${{ matrix.name }}
+          build-args: |
+            APP_VERSION=${{ github.sha }}
+          provenance: true   # supply-chain attestation
+
+      - name: Scan image
+        uses: aquasecurity/trivy-action@0.20.0
+        with:
+          image-ref: ${{ steps.ecr.outputs.registry }}/${{ matrix.name }}:${{ github.sha }}
+          severity: CRITICAL,HIGH
+          exit-code: "1"
+          ignore-unfixed: true   # fail on what we can actually act on
