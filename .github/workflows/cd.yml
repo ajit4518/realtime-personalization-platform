@@ -1,0 +1,166 @@
+name: Deploy
+
+on:
+  workflow_run:
+    workflows: [CI]
+    types: [completed]
+    branches: [main]
+  workflow_dispatch:
+    inputs:
+      image_tag:
+        description: "Commit SHA to deploy (defaults to the current HEAD)"
+        required: false
+
+# Never deploy two versions concurrently, and never cancel a deploy midway:
+# a half-applied rollout is worse than a queued one.
+concurrency:
+  group: deploy-production
+  cancel-in-progress: false
+
+jobs:
+  deploy-staging:
+    if: github.event.workflow_run.conclusion == 'success' || github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    environment: staging
+    permissions:
+      contents: read
+      id-token: write
+    outputs:
+      image_tag: ${{ steps.resolve.outputs.tag }}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - id: resolve
+        run: echo "tag=${{ inputs.image_tag || github.sha }}" >> "$GITHUB_OUTPUT"
+
+      - uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_DEPLOY_ROLE_ARN }}
+          aws-region: us-east-1
+
+      - name: Configure kubectl
+        run: aws eks update-kubeconfig --name streaming-staging-eks --region us-east-1
+
+      - name: Deploy
+        run: |
+          helm upgrade --install recommendations deploy/helm \
+            --namespace serving --create-namespace \
+            --values deploy/helm/values-staging.yaml \
+            --set image.tag=${{ steps.resolve.outputs.tag }} \
+            --atomic \
+            --timeout 10m
+          # --atomic rolls back automatically if the release fails to become
+          # healthy, so a bad deploy self-heals instead of waiting for a human.
+
+      - name: Verify rollout
+        run: |
+          kubectl -n serving rollout status deployment/recommendations --timeout=5m
+          kubectl -n serving get pods -l app.kubernetes.io/name=recommendations
+
+      - name: Smoke test
+        run: |
+          kubectl -n serving run smoke-$RANDOM --rm -i --restart=Never \
+            --image=curlimages/curl:8.8.0 -- \
+            curl -fsS --max-time 10 \
+            "http://recommendations:8000/recommendations?profile_id=101&region_code=us-east&limit=5"
+
+  # A load test between staging and production, because a latency regression is
+  # exactly the kind of defect that unit tests never catch and users notice
+  # within seconds.
+  performance-gate:
+    needs: deploy-staging
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_DEPLOY_ROLE_ARN }}
+          aws-region: us-east-1
+
+      - name: Run k6 against staging
+        uses: grafana/run-k6-action@v1
+        with:
+          path: load-tests/recommendations.js
+        env:
+          K6_TARGET: ${{ secrets.STAGING_API_URL }}
+          # These thresholds are the SLO, expressed as a build failure. If the
+          # change cannot hold p99 under 50ms it does not reach production.
+          K6_THRESHOLD_P99_MS: "50"
+          K6_THRESHOLD_ERROR_RATE: "0.001"
+
+  deploy-production:
+    needs: performance-gate
+    runs-on: ubuntu-latest
+    # Requires a manual approval configured on this environment. Automating the
+    # path to production is good; removing the human decision is not.
+    environment: production
+    permissions:
+      contents: read
+      id-token: write
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_DEPLOY_ROLE_ARN }}
+          aws-region: us-east-1
+
+      - name: Configure kubectl
+        run: aws eks update-kubeconfig --name streaming-prod-eks --region us-east-1
+
+      - name: Record the current release for rollback
+        id: current
+        run: |
+          echo "revision=$(helm -n serving history recommendations -o json \
+            | jq -r 'map(select(.status=="deployed")) | .[0].revision')" >> "$GITHUB_OUTPUT"
+
+      # Canary first: 5% of live traffic against the new version for ten
+      # minutes. Real requests find problems that synthetic tests do not.
+      - name: Deploy canary
+        run: |
+          helm upgrade --install recommendations-canary deploy/helm \
+            --namespace serving \
+            --values deploy/helm/values-prod.yaml \
+            --set image.tag=${{ needs.deploy-staging.outputs.image_tag }} \
+            --set canary.enabled=true \
+            --set replicaCount=2 \
+            --atomic --timeout 10m
+
+      - name: Watch canary error rate
+        run: |
+          echo "Observing canary for 10 minutes..."
+          for i in $(seq 1 20); do
+            sleep 30
+            ERRORS=$(kubectl -n serving exec deploy/recommendations-canary -- \
+              sh -c "curl -s localhost:8000/metrics | grep -c 'recommendation_requests_total.*status=\"error\"' || true")
+            if [ "${ERRORS:-0}" -gt 5 ]; then
+              echo "::error::Canary error rate exceeded threshold, aborting"
+              helm -n serving uninstall recommendations-canary
+              exit 1
+            fi
+          done
+          echo "Canary healthy."
+
+      - name: Promote to the full fleet
+        run: |
+          helm upgrade --install recommendations deploy/helm \
+            --namespace serving \
+            --values deploy/helm/values-prod.yaml \
+            --set image.tag=${{ needs.deploy-staging.outputs.image_tag }} \
+            --atomic --timeout 15m
+          helm -n serving uninstall recommendations-canary || true
+
+      - name: Verify
+        run: kubectl -n serving rollout status deployment/recommendations --timeout=10m
+
+      - name: Roll back on failure
+        if: failure()
+        run: |
+          echo "::error::Deployment failed, reverting to revision ${{ steps.current.outputs.revision }}"
+          helm -n serving rollback recommendations ${{ steps.current.outputs.revision }} --wait --timeout 10m
