@@ -1,0 +1,185 @@
+# Full local stack. `make up` brings up every component the platform needs, and
+# `make seed` puts data through it, so the whole pipeline can be exercised on a
+# laptop without an AWS account.
+#
+# Deliberately mirrors production topology rather than simplifying it: the same
+# CDC connector, the same Schema Registry contracts, the same Flink jobs. A
+# local stack that skips the awkward parts hides exactly the bugs worth finding
+# early.
+
+name: personalization-platform
+
+services:
+
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: platform
+      POSTGRES_PASSWORD: platform
+      POSTGRES_DB: streaming
+    # Logical replication is off by default and Debezium cannot work without
+    # it. This is the same setting the RDS parameter group applies.
+    command:
+      - postgres
+      - -c
+      - wal_level=logical
+      - -c
+      - max_replication_slots=10
+      - -c
+      - max_wal_senders=10
+    ports: ["5432:5432"]
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+      - ./platform/postgres:/docker-entrypoint-initdb.d:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U platform -d streaming"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  kafka:
+    image: confluentinc/cp-kafka:7.6.1
+    environment:
+      # KRaft: no ZooKeeper. One less service to run and to explain.
+      KAFKA_NODE_ID: 1
+      KAFKA_PROCESS_ROLES: broker,controller
+      KAFKA_CONTROLLER_QUORUM_VOTERS: 1@kafka:29093
+      KAFKA_LISTENERS: PLAINTEXT://kafka:29092,CONTROLLER://kafka:29093,EXTERNAL://0.0.0.0:9092
+      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://kafka:29092,EXTERNAL://localhost:9092
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: CONTROLLER:PLAINTEXT,PLAINTEXT:PLAINTEXT,EXTERNAL:PLAINTEXT
+      KAFKA_INTER_BROKER_LISTENER_NAME: PLAINTEXT
+      KAFKA_CONTROLLER_LISTENER_NAMES: CONTROLLER
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: 1
+      KAFKA_AUTO_CREATE_TOPICS_ENABLE: "false"
+      CLUSTER_ID: MkU3OEVBNTcwNTJENDM2Qk
+    ports: ["9092:9092"]
+    volumes:
+      - kafka_data:/var/lib/kafka/data
+    healthcheck:
+      test: ["CMD-SHELL", "kafka-broker-api-versions --bootstrap-server localhost:29092 >/dev/null 2>&1"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+
+  schema-registry:
+    image: confluentinc/cp-schema-registry:7.6.1
+    depends_on:
+      kafka: {condition: service_healthy}
+    environment:
+      SCHEMA_REGISTRY_HOST_NAME: schema-registry
+      SCHEMA_REGISTRY_KAFKASTORE_BOOTSTRAP_SERVERS: kafka:29092
+      SCHEMA_REGISTRY_LISTENERS: http://0.0.0.0:8081
+      # BACKWARD compatibility: a consumer can always be upgraded after a
+      # producer. This is what makes independent deploys safe.
+      SCHEMA_REGISTRY_SCHEMA_COMPATIBILITY_LEVEL: BACKWARD
+    ports: ["8081:8081"]
+    healthcheck:
+      test: ["CMD-SHELL", "curl -fsS http://localhost:8081/subjects || exit 1"]
+      interval: 10s
+      retries: 10
+
+  connect:
+    image: debezium/connect:2.6
+    depends_on:
+      kafka: {condition: service_healthy}
+      schema-registry: {condition: service_healthy}
+      postgres: {condition: service_healthy}
+    environment:
+      BOOTSTRAP_SERVERS: kafka:29092
+      GROUP_ID: connect-local
+      CONFIG_STORAGE_TOPIC: _connect_configs
+      OFFSET_STORAGE_TOPIC: _connect_offsets
+      STATUS_STORAGE_TOPIC: _connect_status
+      KEY_CONVERTER: io.confluent.connect.avro.AvroConverter
+      VALUE_CONVERTER: io.confluent.connect.avro.AvroConverter
+      CONNECT_KEY_CONVERTER_SCHEMA_REGISTRY_URL: http://schema-registry:8081
+      CONNECT_VALUE_CONVERTER_SCHEMA_REGISTRY_URL: http://schema-registry:8081
+      PGHOST: postgres
+      PGUSER: platform
+      PGPASSWORD: platform
+      PGDATABASE: streaming
+      SCHEMA_REGISTRY_URL: http://schema-registry:8081
+    ports: ["8083:8083"]
+    healthcheck:
+      test: ["CMD-SHELL", "curl -fsS http://localhost:8083/connectors || exit 1"]
+      interval: 10s
+      retries: 15
+
+  redis:
+    image: redis:7.2-alpine
+    command: redis-server --maxmemory 512mb --maxmemory-policy allkeys-lru --save ""
+    ports: ["6379:6379"]
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      retries: 5
+
+  flink-jobmanager:
+    build:
+      context: ./streaming
+    command: jobmanager
+    depends_on:
+      kafka: {condition: service_healthy}
+      redis: {condition: service_healthy}
+    environment:
+      FLINK_PROPERTIES: |
+        jobmanager.rpc.address: flink-jobmanager
+        state.backend.type: rocksdb
+        execution.checkpointing.interval: 30s
+      KAFKA_BROKERS: kafka:29092
+      REDIS_URL: redis://redis:6379
+    ports: ["8082:8081"]   # 8081 is taken by Schema Registry
+
+  flink-taskmanager:
+    build:
+      context: ./streaming
+    command: taskmanager
+    depends_on: [flink-jobmanager]
+    # Two task managers so the parallelism and rescaling behaviour resemble a
+    # real cluster rather than a single-slot toy.
+    deploy:
+      replicas: 2
+    environment:
+      FLINK_PROPERTIES: |
+        jobmanager.rpc.address: flink-jobmanager
+        taskmanager.numberOfTaskSlots: 4
+        taskmanager.memory.process.size: 2g
+      KAFKA_BROKERS: kafka:29092
+      REDIS_URL: redis://redis:6379
+
+  recommendations:
+    build:
+      context: ./serving
+    depends_on:
+      redis: {condition: service_healthy}
+    environment:
+      RECO_REDIS_URL: redis://redis:6379
+      RECO_MODEL_PATH: /opt/models/current
+      RECO_INDEX_PATH: /opt/models/index
+      RECO_CATALOG_PATH: /opt/models/catalog.json
+    ports: ["8000:8000"]
+    volumes:
+      - ./artifacts:/opt/models:ro
+
+  minio:
+    # Stands in for S3 so the Connect sink and the warehouse read path work
+    # locally with the same code as production.
+    image: minio/minio:RELEASE.2024-06-13T22-53-53Z
+    command: server /data --console-address ":9001"
+    environment:
+      MINIO_ROOT_USER: minioadmin
+      MINIO_ROOT_PASSWORD: minioadmin
+    ports: ["9000:9000", "9001:9001"]
+    volumes:
+      - minio_data:/data
+    healthcheck:
+      test: ["CMD", "mc", "ready", "local"]
+      interval: 10s
+      retries: 5
+
+volumes:
+  postgres_data:
+  kafka_data:
+  minio_data:
