@@ -1,0 +1,26 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ include "recommendations.fullname" . }}-config
+  labels: {{- include "recommendations.labels" . | nindent 4 }}
+data:
+  # Non-secret tuning. The deployment takes a checksum of this file so an edit
+  # here triggers a rollout rather than applying only to pods that happen to
+  # restart later.
+  RECO_FEATURE_TIMEOUT_SECONDS: {{ .Values.tuning.featureTimeoutSeconds | quote }}
+  RECO_REDIS_POOL_SIZE: {{ .Values.tuning.redisPoolSize | quote }}
+  RECO_MAX_PER_GENRE: {{ .Values.tuning.maxPerGenre | quote }}
+  RECO_LOG_LEVEL: {{ .Values.tuning.logLevel | quote }}
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: {{ include "recommendations.serviceAccountName" . }}
+  labels: {{- include "recommendations.labels" . | nindent 4 }}
+  {{- with .Values.serviceAccount.annotations }}
+  annotations: {{- toYaml . | nindent 4 }}
+  {{- end }}
+# No token is mounted: this pod talks to AWS via IRSA and never calls the
+# Kubernetes API, so a projected service account token would be an unnecessary
+# credential sitting in the container filesystem.
+automountServiceAccountToken: false

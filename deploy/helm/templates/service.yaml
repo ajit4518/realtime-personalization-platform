@@ -1,0 +1,29 @@
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ include "recommendations.fullname" . }}
+  labels: {{- include "recommendations.labels" . | nindent 4 }}
+spec:
+  type: {{ .Values.service.type }}
+  ports:
+    - port: {{ .Values.service.port }}
+      targetPort: http
+      protocol: TCP
+      name: http
+  selector: {{- include "recommendations.selectorLabels" . | nindent 4 }}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ include "recommendations.fullname" . }}-headless
+  labels: {{- include "recommendations.labels" . | nindent 4 }}
+spec:
+  # Headless service for Prometheus discovery. Scraping through the load
+  # balancer would sample one arbitrary pod per scrape and produce metrics that
+  # look like noise rather than a per-pod time series.
+  clusterIP: None
+  ports:
+    - port: {{ .Values.service.port }}
+      targetPort: http
+      name: http
+  selector: {{- include "recommendations.selectorLabels" . | nindent 4 }}

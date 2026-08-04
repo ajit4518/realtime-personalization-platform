@@ -1,0 +1,48 @@
+# Staging overrides. Smaller, but the same shape: probes, PDB, autoscaling and
+# canary logic all stay enabled so they are exercised before production sees
+# them.
+
+replicaCount: 2
+
+image:
+  repository: 123456789012.dkr.ecr.us-east-1.amazonaws.com/recommendations
+  pullPolicy: Always   # staging redeploys the same tag often during debugging
+
+serviceAccount:
+  create: true
+  annotations:
+    eks.amazonaws.com/role-arn: arn:aws:iam::123456789012:role/streaming-staging-recommendations
+
+model:
+  bucket: streaming-staging-models
+
+resources:
+  requests:
+    cpu: 500m
+    memory: 2Gi
+  limits:
+    cpu: 2000m
+
+autoscaling:
+  enabled: true
+  minReplicas: 2
+  maxReplicas: 8
+  targetCPUUtilization: 70
+  targetRequestsPerPod: "250"
+
+tuning:
+  featureTimeoutSeconds: "0.015"
+  redisPoolSize: "16"
+  maxPerGenre: "3"
+  logLevel: DEBUG
+
+ingress:
+  enabled: true
+  className: alb
+  annotations:
+    alb.ingress.kubernetes.io/scheme: internal
+    alb.ingress.kubernetes.io/target-type: ip
+    alb.ingress.kubernetes.io/healthcheck-path: /health/ready
+
+canary:
+  enabled: false

@@ -1,0 +1,20 @@
+apiVersion: v2
+name: recommendations
+description: Real-time recommendation API serving a two-stage ranker from an online feature store
+type: application
+
+# Chart version tracks the packaging; appVersion is set at deploy time to the
+# image tag (a git SHA), so the two are deliberately decoupled.
+version: 1.0.0
+appVersion: "1.0.0"
+
+keywords:
+  - recommendations
+  - machine-learning
+  - low-latency
+
+maintainers:
+  - name: Ajit
+
+annotations:
+  category: MachineLearning
