@@ -1,0 +1,14 @@
+packages:
+  # Pinned exactly, not with a range. A minor bump to a test package changing
+  # behaviour mid-sprint is a debugging session nobody planned for.
+  - package: dbt-labs/dbt_utils
+    version: 1.2.0
+
+  - package: calogica/dbt_expectations
+    version: 0.10.4
+
+  # Surfaces run results, test failures, and model timings as models you can
+  # query, which is what turns "the build feels slower" into an answerable
+  # question.
+  - package: elementary-data/elementary
+    version: 0.16.1

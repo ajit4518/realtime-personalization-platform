@@ -1,0 +1,53 @@
+# Connection profiles.
+#
+# No credentials in this file. Everything resolves from the environment, so the
+# same file is safe in version control and behaves identically in CI, on a
+# laptop, and in the Airflow container.
+
+streaming_warehouse:
+  target: dev
+
+  outputs:
+
+    # Local development against the Postgres from docker-compose. Not a
+    # separate dialect from production: Redshift is Postgres-derived, so models
+    # port with very few adapter conditionals.
+    dev:
+      type: postgres
+      host: "{{ env_var('WAREHOUSE_HOST', 'localhost') }}"
+      port: "{{ env_var('WAREHOUSE_PORT', '5432') | int }}"
+      user: "{{ env_var('WAREHOUSE_USER', 'platform') }}"
+      password: "{{ env_var('WAREHOUSE_PASSWORD', 'platform') }}"
+      dbname: "{{ env_var('WAREHOUSE_DATABASE', 'analytics') }}"
+      schema: dev_{{ env_var('USER', 'local') }}
+      threads: 4
+      keepalives_idle: 0
+
+    ci:
+      type: postgres
+      host: localhost
+      port: 5432
+      user: postgres
+      password: test
+      dbname: analytics
+      schema: ci
+      # More threads than dev: CI runners are ephemeral and the only cost of
+      # parallelism there is contention with itself.
+      threads: 8
+
+    prod:
+      type: redshift
+      host: "{{ env_var('REDSHIFT_HOST') }}"
+      port: 5439
+      user: "{{ env_var('REDSHIFT_USER') }}"
+      # IAM authentication rather than a stored password: credentials are
+      # short-lived and issued to the pod's role.
+      method: iam
+      cluster_id: "{{ env_var('REDSHIFT_WORKGROUP') }}"
+      dbname: analytics
+      schema: analytics
+      threads: 8
+      # Long enough for the widest feature model, short enough that a runaway
+      # query does not hold the build open all night.
+      connect_timeout: 30
+      sslmode: require

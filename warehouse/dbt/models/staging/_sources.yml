@@ -30,6 +30,12 @@ sources:
       - name: titles
       - name: title_availability
         freshness: null  # Reference data; changes rarely and a stale read is harmless.
+      - name: genres
+        freshness: null
+      - name: title_genres
+        freshness: null
+      - name: regions
+        freshness: null
       - name: watch_sessions
         freshness:
           warn_after: {count: 15, period: minute}
@@ -71,3 +77,19 @@ sources:
       - name: qoe_alerts
         description: "Regressions the detector raised. Joined against incidents for precision tracking."
         freshness: null
+
+      - name: online_feature_audit
+        description: >
+          Sample of what the Flink job actually wrote to Redis, snapshotted daily.
+          Exists solely so `assert_online_offline_feature_parity` can compare the
+          served feature values against what the warehouse computes for the same
+          sessions. Without this table the two paths could diverge indefinitely
+          with nothing to detect it.
+        freshness:
+          warn_after: {count: 26, period: hour}
+          error_after: {count: 48, period: hour}
+        columns:
+          - name: session_id
+            tests: [not_null]
+          - name: snapshot_date
+            tests: [not_null]

@@ -1,0 +1,13 @@
+# Profile used by the CI workflow, pointing at the Postgres service container.
+streaming_warehouse:
+  target: ci
+  outputs:
+    ci:
+      type: postgres
+      host: localhost
+      port: 5432
+      user: postgres
+      password: test
+      dbname: analytics
+      schema: ci
+      threads: 8
